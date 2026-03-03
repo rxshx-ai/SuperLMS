@@ -82,7 +82,12 @@ class LLMBridgeAgent:
             username=config.MOODLE_USERNAME,
             password=config.MOODLE_PASSWORD,
         )
-        self.llm = LLMClient(api_key=config.GROQ_API_KEY)
+        api_key = (
+            config.GEMINI_API_KEY
+            if config.LLM_PROVIDER == "gemini"
+            else config.GROQ_API_KEY
+        )
+        self.llm = LLMClient(provider=config.LLM_PROVIDER, api_key=api_key)
         self.processed_ids = load_processed_ids()
         self._running = True
 

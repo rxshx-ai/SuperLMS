@@ -1,4 +1,6 @@
 requests>=2.31.0
 beautifulsoup4>=4.12.0
-groq>=0.9.0
 python-dotenv>=1.0.0
+# LLM backends — install one or both depending on LLM_PROVIDER
+google-generativeai>=0.7.0
+groq>=0.9.0
