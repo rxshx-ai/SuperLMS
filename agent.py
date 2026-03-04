@@ -2,7 +2,7 @@
 Moodle LLM Bridge — Main Agent
 
 Continuously polls the Moodle LMS for blog entries tagged as prompts
-([LLMQ]), forwards them to the Gemini LLM, and posts the responses
+([LLMQ]), forwards them to the Groq LLM, and posts the responses
 back as new blog entries tagged [LLMR#<id>].
 
 Usage:
@@ -14,13 +14,13 @@ import time
 import signal
 import logging
 import sys
-import os
 import html
+import threading
 from pathlib import Path
 
 import config
 from moodle_client import MoodleClient, BlogEntry
-from gemini_client import LLMClient
+from llm_client import LLMClient
 
 # ── Logging Setup ─────────────────────────────────────────────────────
 
@@ -62,14 +62,14 @@ def save_processed_ids(ids: set):
 
 class LLMBridgeAgent:
     """
-    The main agent that bridges Moodle blog ↔ Gemini LLM.
+    The main agent that bridges Moodle blog ↔ Groq LLM.
 
     Workflow per poll cycle:
       1. Fetch all blog entries for the logged-in user
       2. Identify NEW prompts ([LLMQ] prefix, not yet processed)
       3. For each new prompt:
          a. Extract the actual question
-         b. Send to Gemini
+         b. Send to Groq
          c. Post the response as [LLMR#<entry_id>] blog entry
          d. Mark the prompt as processed
     """
@@ -82,12 +82,7 @@ class LLMBridgeAgent:
             username=config.MOODLE_USERNAME,
             password=config.MOODLE_PASSWORD,
         )
-        api_key = (
-            config.GEMINI_API_KEY
-            if config.LLM_PROVIDER == "gemini"
-            else config.GROQ_API_KEY
-        )
-        self.llm = LLMClient(provider=config.LLM_PROVIDER, api_key=api_key)
+        self.llm = LLMClient(api_key=config.GROQ_API_KEY)
         self.processed_ids = load_processed_ids()
         self._running = True
 
@@ -162,7 +157,7 @@ class LLMBridgeAgent:
             logger.debug("No new prompts to process.")
             return
 
-        logger.info("🔍  Found %d new prompt(s) to process.", len(new_prompts))
+        logger.info("Found %d new prompt(s) to process.", len(new_prompts))
 
         for prompt_entry in new_prompts:
             self._process_prompt(prompt_entry)
@@ -171,8 +166,9 @@ class LLMBridgeAgent:
         """Process a single prompt: get LLM response and post it back."""
         prompt_text = self.extract_prompt_text(prompt_entry)
         logger.info(
-            "⚡  Processing prompt #%d: %.80s…",
-            prompt_entry.entry_id, prompt_text,
+            "Processing prompt #%d: %.80s...",
+            prompt_entry.entry_id,
+            prompt_text,
         )
 
         # 1. Get LLM response
@@ -192,27 +188,30 @@ class LLMBridgeAgent:
         )
 
         # 3. Post the response
+        # Force replies to be created as "Yourself (draft)" for privacy.
         try:
             success = self.moodle.create_blog_entry(
                 subject=response_subject,
                 body=response_body,
-                publish_state=config.PUBLISH_STATE,
+                publish_state="draft",
             )
             if success:
                 self.processed_ids.add(prompt_entry.entry_id)
                 save_processed_ids(self.processed_ids)
                 logger.info(
-                    "✅  Posted response for prompt #%d", prompt_entry.entry_id
+                    "Posted response for prompt #%d",
+                    prompt_entry.entry_id,
                 )
             else:
                 logger.error(
-                    "❌  Failed to post response for prompt #%d",
+                    "Failed to post response for prompt #%d",
                     prompt_entry.entry_id,
                 )
         except Exception as e:
             logger.error(
-                "❌  Error posting response for #%d: %s",
-                prompt_entry.entry_id, e,
+                "Error posting response for #%d: %s",
+                prompt_entry.entry_id,
+                e,
             )
 
     @staticmethod
@@ -241,12 +240,15 @@ class LLMBridgeAgent:
     def run(self):
         """Start the continuous polling loop."""
         logger.info("=" * 60)
-        logger.info("  Moodle LLM Bridge Agent — Starting")
+        logger.info("Moodle LLM Bridge Agent - Starting")
         logger.info("=" * 60)
 
-        # Register graceful shutdown
-        signal.signal(signal.SIGINT, self._shutdown)
-        signal.signal(signal.SIGTERM, self._shutdown)
+        # Register graceful shutdown only when running in the main thread.
+        # When embedded in a FastAPI app we run in a background thread,
+        # where signal.signal(...) would raise ValueError.
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGINT, self._shutdown)
+            signal.signal(signal.SIGTERM, self._shutdown)
 
         # Login once (re-login handled automatically)
         try:
@@ -256,7 +258,7 @@ class LLMBridgeAgent:
             sys.exit(1)
 
         logger.info(
-            "🔄  Polling every %ds for [LLMQ] entries …",
+            "Polling every %ds for [LLMQ] entries",
             config.POLL_INTERVAL,
         )
 
@@ -269,7 +271,7 @@ class LLMBridgeAgent:
 
     def _shutdown(self, signum, frame):
         """Handle graceful shutdown."""
-        logger.info("Received signal %s — shutting down …", signum)
+        logger.info("Received signal %s - shutting down", signum)
         self._running = False
 
 

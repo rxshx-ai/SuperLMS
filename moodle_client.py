@@ -6,9 +6,8 @@ on a Moodle LMS instance via its web interface.
 """
 
 import re
-import time
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 
 import requests
@@ -120,8 +119,9 @@ class MoodleClient:
 
         self._logged_in = True
         logger.info(
-            "✅  Logged in  |  sesskey=%s  userid=%s",
-            self.sesskey, self.userid,
+            "Logged in | sesskey=%s userid=%s",
+            self.sesskey,
+            self.userid,
         )
         return True
 
@@ -234,7 +234,7 @@ class MoodleClient:
             logger.error("Failed to create blog entry: %s", subject)
             return False
 
-        logger.info("📝  Created blog entry: %s", subject)
+        logger.info("Created blog entry: %s", subject)
         return True
 
     # ── Private Helpers ───────────────────────────────────────────────
