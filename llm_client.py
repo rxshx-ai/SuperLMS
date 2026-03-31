@@ -14,7 +14,7 @@ logger = logging.getLogger("llm")
 
 _SYSTEM_PROMPT = (
     "You are a helpful AI assistant. The user is asking you a question "
-    "through a Moodle LMS blog relay system. Provide a clear, well-formatted "
+    "through a Moodle LMS dashboard text-block relay system. Provide a clear, well-formatted "
     "response. Use plain text with simple formatting (no markdown headers with #). "
     "Keep the response concise but thorough."
 )

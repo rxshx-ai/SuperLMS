@@ -8,11 +8,11 @@ Use your university LMS as a relay to access an LLM — even when the internet i
 ┌─────────────────────┐          ┌───────────────────┐          ┌──────────────┐
 │  YOU (University)   │          │  AGENT (Cloud)     │          │   Groq LLM   │
 │                     │  poll    │                    │  query   │  (e.g. Llama│
-│  Post blog entry:   │◄────────│  Scans for [LLMQ]  │─────────►│   models)    │
-│  [LLMQ] My question │         │  entries every 30s │          │  Returns     │
+│  Create text block: │◄────────│  Scans for [LLMQ]  │─────────►│   models)    │
+│  [LLMQ] My question │         │  blocks every 30s  │          │  Returns     │
 │                     │  post   │                    │◄─────────│  response    │
 │  Read response:     │◄────────│  Posts [LLMR#id]   │          │              │
-│  [LLMR#42] Re: ...  │         │  blog entry back   │          │              │
+│  [LLMR#42] Re: ...  │         │  text block back   │          │              │
 └─────────────────────┘          └───────────────────┘          └──────────────┘
 ```
 
@@ -45,16 +45,16 @@ python agent.py
 
 ### Posting a Prompt (on your university LMS)
 
-1. Go to **lms.vitc.ac.in** → **Blog** → **Add a new entry**
-2. Set the **title** to: `[LLMQ] Your question here`
-3. Optionally write a longer prompt in the **body**
-4. Save the entry
+1. Go to **Dashboard** and turn **Edit mode** ON.
+2. Add or edit a **Text** block.
+3. Put `[LLMQ] Your question here` in the block title or at the start of block content.
+4. Save changes.
 
 ### Reading the Response
 
 - The agent will pick up your prompt within ~30 seconds
-- A new blog entry will appear titled: `[LLMR#<id>] Re: Your question here`
-- Open it to read the LLM response
+- A new dashboard text block will appear titled: `[LLMR#<id>] Re: Your question here`
+- Open the block to read the LLM response
 
 ## Markers & Safety
 
@@ -65,7 +65,7 @@ python agent.py
 
 - The agent **only** processes entries starting with `[LLMQ]`
 - It **never** processes `[LLMR#...]` entries → **no infinite loops**
-- Processed prompt IDs are saved to `processed_ids.json` to avoid duplicates
+- Processed prompt block IDs are saved to `processed_ids.json` to avoid duplicates
 
 ## Configuration
 
@@ -76,7 +76,7 @@ python agent.py
 | `MOODLE_PASSWORD` | —                        | LMS login password                            |
 | `GROQ_API_KEY`    | —                        | Groq API key                                  |
 | `POLL_INTERVAL`   | `30`                     | Seconds between scans                         |
-| `PUBLISH_STATE`   | `draft`                  | Blog visibility: `site`, `public`, or `draft` |
+| `PUBLISH_STATE`   | `draft`                  | Legacy blog-mode setting (not used for text blocks) |
 
 ## FastAPI HTTP Service
 
@@ -133,5 +133,5 @@ python agent.py
 ## Troubleshooting
 
 - **Login fails**: Check your username/password. Some Moodle instances use SSO — this tool requires direct login.
-- **No entries found**: Make sure your blog entries are visible. Check publish state.
+- **No prompts found**: Ensure the prompt starts with `[LLMQ]` in a dashboard text block.
 - **Agent stops**: Check `agent.log` for errors. The agent auto-reconnects on session expiry.

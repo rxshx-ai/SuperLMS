@@ -1,14 +1,17 @@
 """
 Moodle web-scraping client.
 
-Handles login, reading blog entries, and creating new blog entries
+Handles login plus both:
+    - blog entry operations (legacy flow)
+    - dashboard text block operations (current flow)
 on a Moodle LMS instance via its web interface.
 """
 
 import re
 import logging
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
+from urllib.parse import urljoin
 
 import requests
 import urllib3
@@ -33,6 +36,16 @@ class BlogEntry:
     raw_html: str = ""
 
 
+@dataclass
+class TextBlock:
+    """Represents a dashboard HTML/Text block instance."""
+    block_id: int
+    title: str
+    body: str
+    block_region: str = ""
+    raw_html: str = ""
+
+
 # ── Client ────────────────────────────────────────────────────────────
 
 class MoodleClient:
@@ -40,9 +53,10 @@ class MoodleClient:
     Interacts with a Moodle LMS via its web interface.
 
     Uses session-based authentication (cookies) to:
-      • Log in with username/password
-      • Fetch blog entries
-      • Create new blog entries
+            - Log in with username/password
+            - Fetch and update dashboard text blocks
+            - Fetch blog entries
+            - Create new blog entries
     """
 
     def __init__(self, base_url: str, username: str, password: str):
@@ -76,7 +90,7 @@ class MoodleClient:
 
         Returns True on success, raises on failure.
         """
-        logger.info("Logging in to %s as %s …", self.base_url, self.username)
+        logger.info("Logging in to %s as %s ...", self.base_url, self.username)
 
         # Step 1 – get login page and extract the CSRF logintoken
         login_url = f"{self.base_url}/login/index.php"
@@ -139,12 +153,323 @@ class MoodleClient:
             if resp.status_code in (301, 302, 303):
                 location = resp.headers.get("Location", "")
                 if "login" in location:
-                    logger.warning("Session expired — re-logging in …")
+                    logger.warning("Session expired - re-logging in ...")
                     self._logged_in = False
                     self.login()
         except requests.RequestException:
             self._logged_in = False
             self.login()
+
+    # ── Dashboard Text Blocks ────────────────────────────────────────
+
+    def get_dashboard_text_blocks(
+        self,
+        edit_mode: bool = True,
+        block_region: Optional[str] = None,
+    ) -> List[TextBlock]:
+        """
+        Fetch dashboard HTML/Text blocks from /my/.
+
+        Args:
+            edit_mode: Enable dashboard edit mode first (recommended), so
+                block controls such as bui_editid links are available.
+            block_region: Optional Moodle region filter (e.g. "content",
+                "side-pre"). If provided, only blocks in that region
+                are returned.
+        """
+        html = self._get_dashboard_html(edit_mode=edit_mode)
+        blocks = self._parse_dashboard_text_blocks(html)
+        if not block_region:
+            return blocks
+        return [b for b in blocks if b.block_region == block_region]
+
+    def create_dashboard_text_block(
+        self,
+        title: str,
+        body: str,
+        block_region: str = "content",
+    ) -> Optional[int]:
+        """
+        Create a new dashboard text block, then fill it with content.
+
+        Uses Moodle's standard block manager flow:
+          1. Open Add block picker (bui_addblock)
+          2. Select Text block (bui_addblock=html)
+          3. Locate newly-created block id
+          4. Submit the block configuration form
+
+        Returns the created block_id on success, else None.
+        """
+        self.ensure_logged_in()
+
+        dashboard_html = self._get_dashboard_html(edit_mode=True)
+        before_ids = {
+            block.block_id for block in self._parse_dashboard_text_blocks(dashboard_html)
+        }
+
+        add_links = self._extract_add_block_links(dashboard_html)
+        if not add_links:
+            raise RuntimeError("Could not find 'Add a block' link in dashboard edit mode.")
+
+        # Prefer adding to the main content region if that link is available.
+        chosen_add_link = next(
+            (u for u in add_links if f"bui_blockregion={block_region}" in u),
+            add_links[0],
+        )
+
+        picker_resp = self.session.get(chosen_add_link, timeout=30)
+        picker_resp.raise_for_status()
+
+        text_block_add_url = self._extract_block_choice_url(
+            picker_resp.text,
+            block_name="html",
+            base_url=picker_resp.url,
+        )
+        if not text_block_add_url:
+            raise RuntimeError("Could not find text block option (bui_addblock=html).")
+
+        add_resp = self.session.get(text_block_add_url, timeout=30, allow_redirects=True)
+        add_resp.raise_for_status()
+
+        after_html = self._get_dashboard_html(edit_mode=True)
+        after_blocks = self._parse_dashboard_text_blocks(after_html)
+        target_region_blocks = [
+            b for b in after_blocks if b.block_region == block_region
+        ]
+        new_ids = [
+            b.block_id for b in target_region_blocks if b.block_id not in before_ids
+        ]
+
+        if not new_ids:
+            # Fallback: if region metadata was missing, detect globally.
+            new_ids = [b.block_id for b in after_blocks if b.block_id not in before_ids]
+
+        if new_ids:
+            new_block_id = max(new_ids)
+        else:
+            # Fallback: grab the most recent "(new text block)" placeholder.
+            placeholder_ids = [
+                b.block_id
+                for b in target_region_blocks or after_blocks
+                if b.title.strip().lower() == "(new text block)"
+            ]
+            if placeholder_ids:
+                new_block_id = max(placeholder_ids)
+            else:
+                logger.error("Text block add request completed but no new block id was detected.")
+                return None
+
+        if not self.update_dashboard_text_block(
+            new_block_id,
+            title=title,
+            body=body,
+            block_region=block_region,
+        ):
+            return None
+
+        logger.info("Created dashboard text block #%s: %s", new_block_id, title)
+        return new_block_id
+
+    def update_dashboard_text_block(
+        self,
+        block_id: int,
+        title: str,
+        body: str,
+        block_region: str = "content",
+    ) -> bool:
+        """
+        Update an existing dashboard text block by block instance id.
+
+        This opens /my/index.php?bui_editid=<id>, then submits the
+        block_html edit form with updated title/body.
+        """
+        self.ensure_logged_in()
+
+        dashboard_html = self._get_dashboard_html(edit_mode=True)
+        edit_url = self._find_text_block_edit_url(dashboard_html, block_id)
+
+        edit_resp = self.session.get(edit_url, timeout=30)
+        edit_resp.raise_for_status()
+
+        soup = BeautifulSoup(edit_resp.text, "html.parser")
+        form = soup.find("form")
+        if not form:
+            raise RuntimeError(f"Could not find text block edit form for block #{block_id}.")
+
+        payload = self._build_form_payload(form)
+        payload["bui_editid"] = str(block_id)
+        payload["config_title"] = title
+        payload["config_text[text]"] = body
+
+        # Force blocks to remain in the chosen dashboard region.
+        if block_region:
+            payload["bui_region"] = block_region
+            payload["bui_defaultregion"] = block_region
+
+        if not payload.get("config_text[format]"):
+            payload["config_text[format]"] = "1"
+        payload["submitbutton"] = payload.get("submitbutton") or "Save changes"
+
+        action = form.get("action") or f"{self.base_url}/my/index.php"
+        post_resp = self.session.post(action, data=payload, timeout=30)
+        post_resp.raise_for_status()
+
+        if "errorbox" in post_resp.text.lower() or "error" in post_resp.url.lower():
+            logger.error("Failed to update dashboard text block #%s", block_id)
+            return False
+
+        logger.info("Updated dashboard text block #%s: %s", block_id, title)
+        return True
+
+    def _get_dashboard_html(self, edit_mode: bool = False) -> str:
+        """Load dashboard HTML, optionally after enabling edit mode."""
+        self.ensure_logged_in()
+        if edit_mode:
+            self._enable_dashboard_edit_mode()
+
+        resp = self.session.get(f"{self.base_url}/my/", timeout=30)
+        resp.raise_for_status()
+        return resp.text
+
+    def _enable_dashboard_edit_mode(self):
+        """Enable dashboard edit mode via /editmode.php form submit."""
+        self.ensure_logged_in()
+
+        resp = self.session.get(f"{self.base_url}/my/", timeout=30)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        form = soup.find("form", class_=re.compile(r"editmode-switch-form", re.I))
+        if not form:
+            logger.debug("Edit mode form not found on dashboard.")
+            return
+
+        switch = form.find("input", {"name": "setmode"})
+        if switch and switch.has_attr("checked"):
+            return
+
+        payload = {}
+        for inp in form.find_all("input"):
+            name = inp.get("name")
+            if not name:
+                continue
+            if (inp.get("type") or "").lower() == "checkbox":
+                continue
+            payload[name] = inp.get("value", "")
+
+        payload["setmode"] = "1"
+        action = form.get("action") or f"{self.base_url}/editmode.php"
+        toggle_resp = self.session.post(action, data=payload, timeout=30)
+        toggle_resp.raise_for_status()
+
+    def _extract_add_block_links(self, dashboard_html: str) -> List[str]:
+        """Extract dashboard Add block links (bui_addblock)."""
+        soup = BeautifulSoup(dashboard_html, "html.parser")
+        links = []
+        for anchor in soup.find_all("a", href=True):
+            href = anchor["href"]
+            if "bui_addblock" in href:
+                links.append(urljoin(self.base_url, href))
+        return links
+
+    def _extract_block_choice_url(
+        self,
+        picker_html: str,
+        block_name: str,
+        base_url: Optional[str] = None,
+    ) -> Optional[str]:
+        """Find a specific block type choice URL in the Add block picker."""
+        soup = BeautifulSoup(picker_html, "html.parser")
+        patt = re.compile(rf"(?:\?|&)bui_addblock={re.escape(block_name)}(?:&|$)")
+        resolve_base = base_url or self.base_url
+        for anchor in soup.find_all("a", href=True):
+            href = anchor["href"]
+            if patt.search(href):
+                return urljoin(resolve_base, href)
+        return None
+
+    def _find_text_block_edit_url(self, dashboard_html: str, block_id: int) -> str:
+        """Find the configure URL for a specific block id (bui_editid)."""
+        soup = BeautifulSoup(dashboard_html, "html.parser")
+        patt = re.compile(rf"(?:\?|&)bui_editid={block_id}(?:&|$)")
+        link = soup.find("a", href=patt)
+        if link and link.get("href"):
+            return urljoin(self.base_url, link["href"])
+        return f"{self.base_url}/my/index.php?bui_editid={block_id}"
+
+    def _parse_dashboard_text_blocks(self, html: str) -> List[TextBlock]:
+        """Parse dashboard HTML/Text blocks from /my/ HTML."""
+        soup = BeautifulSoup(html, "html.parser")
+        blocks: List[TextBlock] = []
+        seen_ids = set()
+
+        containers = soup.find_all(["section", "div"], attrs={"data-block": "html"})
+        if not containers:
+            containers = soup.find_all(["section", "div"], class_=re.compile(r"block_html", re.I))
+
+        for container in containers:
+            block = self._parse_single_text_block(container)
+            if not block:
+                continue
+            if block.block_id in seen_ids:
+                continue
+            seen_ids.add(block.block_id)
+            blocks.append(block)
+
+        logger.debug("Parsed %d dashboard text block(s)", len(blocks))
+        return blocks
+
+    @staticmethod
+    def _parse_single_text_block(container) -> Optional[TextBlock]:
+        """Parse one dashboard text block from its HTML container."""
+        block_id = None
+        block_region = ""
+
+        instance_id = container.get("data-instance-id")
+        if instance_id and str(instance_id).isdigit():
+            block_id = int(instance_id)
+        else:
+            el_id = container.get("id", "")
+            m = re.search(r"(\d+)", el_id)
+            if m:
+                block_id = int(m.group(1))
+
+        if block_id is None:
+            return None
+
+        region_parent = container.find_parent(attrs={"data-blockregion": True})
+        if region_parent:
+            block_region = (region_parent.get("data-blockregion") or "").strip()
+
+        title = ""
+        title_el = container.find(id=f"instance-{block_id}-header")
+        if title_el:
+            title = title_el.get_text(strip=True)
+        else:
+            for tag in ["h5", "h4", "h3", "h2"]:
+                t = container.find(tag)
+                if t:
+                    title = t.get_text(strip=True)
+                    break
+        if not title:
+            title = (container.get("aria-label") or "").strip()
+
+        body = ""
+        content_el = container.find("div", class_=re.compile(r"\bcontent\b", re.I))
+        if content_el:
+            no_overflow = content_el.find("div", class_=re.compile(r"no-overflow", re.I))
+            if no_overflow:
+                body = no_overflow.get_text("\n", strip=True)
+            else:
+                body = content_el.get_text("\n", strip=True)
+
+        return TextBlock(
+            block_id=block_id,
+            title=title,
+            body=body,
+            block_region=block_region,
+            raw_html=str(container),
+        )
 
     # ── Reading Blog Entries ──────────────────────────────────────────
 
@@ -162,7 +487,7 @@ class MoodleClient:
         if uid:
             params["userid"] = uid
 
-        logger.debug("Fetching blog entries at %s …", url)
+        logger.debug("Fetching blog entries at %s ...", url)
         resp = self.session.get(url, params=params, timeout=30)
         resp.raise_for_status()
 
@@ -287,6 +612,46 @@ class MoodleClient:
             if selected:
                 return selected.get("value", "")
         return None
+
+    @staticmethod
+    def _build_form_payload(form) -> Dict[str, str]:
+        """Build a payload dict from an HTML form element."""
+        payload: Dict[str, str] = {}
+
+        for inp in form.find_all("input"):
+            name = inp.get("name")
+            if not name:
+                continue
+
+            input_type = (inp.get("type") or "").lower()
+            if input_type in {"submit", "button", "image", "file"}:
+                continue
+
+            if input_type in {"checkbox", "radio"} and not inp.has_attr("checked"):
+                continue
+
+            payload[name] = inp.get("value", "")
+
+        for textarea in form.find_all("textarea"):
+            name = textarea.get("name")
+            if not name:
+                continue
+            payload[name] = textarea.get_text() or ""
+
+        for select in form.find_all("select"):
+            name = select.get("name")
+            if not name:
+                continue
+
+            selected = select.find("option", selected=True)
+            if selected:
+                payload[name] = selected.get("value", "")
+            else:
+                first = select.find("option")
+                if first:
+                    payload[name] = first.get("value", "")
+
+        return payload
 
     def _parse_blog_entries(self, html: str) -> List[BlogEntry]:
         """

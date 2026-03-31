@@ -1,9 +1,9 @@
 """
 Moodle LLM Bridge — Main Agent
 
-Continuously polls the Moodle LMS for blog entries tagged as prompts
+Continuously polls Moodle dashboard text blocks tagged as prompts
 ([LLMQ]), forwards them to the Groq LLM, and posts the responses
-back as new blog entries tagged [LLMR#<id>].
+back as new dashboard text blocks tagged [LLMR#<id>].
 
 Usage:
     python agent.py
@@ -19,14 +19,14 @@ import threading
 from pathlib import Path
 
 import config
-from moodle_client import MoodleClient, BlogEntry
+from moodle_client import MoodleClient, TextBlock
 from llm_client import LLMClient
 
 # ── Logging Setup ─────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s │ %(name)-8s │ %(levelname)-5s │ %(message)s",
+    format="%(asctime)s | %(name)-8s | %(levelname)-5s | %(message)s",
     datefmt="%H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
@@ -62,15 +62,15 @@ def save_processed_ids(ids: set):
 
 class LLMBridgeAgent:
     """
-    The main agent that bridges Moodle blog ↔ Groq LLM.
+    The main agent that bridges Moodle dashboard text blocks <-> Groq LLM.
 
     Workflow per poll cycle:
-      1. Fetch all blog entries for the logged-in user
+      1. Fetch all dashboard text blocks
       2. Identify NEW prompts ([LLMQ] prefix, not yet processed)
       3. For each new prompt:
          a. Extract the actual question
          b. Send to Groq
-         c. Post the response as [LLMR#<entry_id>] blog entry
+         c. Post the response as [LLMR#<block_id>] text block
          d. Mark the prompt as processed
     """
 
@@ -89,41 +89,75 @@ class LLMBridgeAgent:
     # ── Prompt / Response Identification ──────────────────────────────
 
     @staticmethod
-    def is_prompt(entry: BlogEntry) -> bool:
-        """Does this entry look like a user prompt?"""
-        return entry.subject.strip().startswith(config.PROMPT_MARKER)
+    def _entry_id(entry: TextBlock) -> int:
+        """Get the stable identifier for a dashboard text block."""
+        return entry.block_id
 
     @staticmethod
-    def is_response(entry: BlogEntry) -> bool:
-        """Does this entry look like an agent response?"""
-        return entry.subject.strip().startswith(config.RESPONSE_MARKER)
+    def _entry_title(entry: TextBlock) -> str:
+        """Get title text from a dashboard text block."""
+        return entry.title or ""
 
     @staticmethod
-    def extract_prompt_text(entry: BlogEntry) -> str:
+    def _entry_body(entry: TextBlock) -> str:
+        """Get body text from a dashboard text block."""
+        return entry.body or ""
+
+    @staticmethod
+    def _strip_marker(text: str, marker: str) -> str:
+        """Remove a marker only if it appears as a leading prefix."""
+        value = (text or "").strip()
+        if value.startswith(marker):
+            return value.replace(marker, "", 1).strip()
+        return value
+
+    @staticmethod
+    def is_prompt(entry: TextBlock) -> bool:
+        """Does this block look like a user prompt?"""
+        title = LLMBridgeAgent._entry_title(entry).strip()
+        body = LLMBridgeAgent._entry_body(entry).strip()
+        return (
+            title.startswith(config.PROMPT_MARKER)
+            or body.startswith(config.PROMPT_MARKER)
+        )
+
+    @staticmethod
+    def is_response(entry: TextBlock) -> bool:
+        """Does this block look like an agent response?"""
+        return LLMBridgeAgent._entry_title(entry).strip().startswith(config.RESPONSE_MARKER)
+
+    @staticmethod
+    def extract_prompt_text(entry: TextBlock) -> str:
         """
-        Get the actual question text from a prompt entry.
+        Get the actual question text from a prompt block.
 
-        The subject has the form:  [LLMQ] What is quantum physics?
+        The title/body can have the prefix: [LLMQ]
         The body may contain the full detailed prompt.
         """
-        # Use body if it has meaningful content, otherwise use the subject
-        subject_text = entry.subject.replace(config.PROMPT_MARKER, "", 1).strip()
+        title_text = LLMBridgeAgent._strip_marker(
+            LLMBridgeAgent._entry_title(entry),
+            config.PROMPT_MARKER,
+        )
+        body_text = LLMBridgeAgent._strip_marker(
+            LLMBridgeAgent._entry_body(entry),
+            config.PROMPT_MARKER,
+        )
 
-        if entry.body and len(entry.body.strip()) > len(subject_text):
-            return entry.body.strip()
-        return subject_text
+        if body_text and len(body_text) > len(title_text):
+            return body_text
+        return title_text or body_text
 
-    def get_response_entry_ids(self, entries: list[BlogEntry]) -> set:
+    def get_response_entry_ids(self, entries: list[TextBlock]) -> set:
         """
         Collect the prompt IDs that already have responses.
 
-        A response entry has subject like  [LLMR#142] Re: ...
+        A response block has title like  [LLMR#142] Re: ...
         We extract 142 as the "already answered" prompt ID.
         """
         answered = set()
         import re
         for e in entries:
-            m = re.match(r'\[LLMR#(\d+)\]', e.subject.strip())
+            m = re.match(r'\[LLMR#(\d+)\]', self._entry_title(e).strip())
             if m:
                 answered.add(int(m.group(1)))
         return answered
@@ -133,13 +167,16 @@ class LLMBridgeAgent:
     def poll_once(self):
         """Run one scan → process → respond cycle."""
         try:
-            entries = self.moodle.get_blog_entries()
+            entries = self.moodle.get_dashboard_text_blocks(
+                edit_mode=True,
+                block_region="content",
+            )
         except Exception as e:
-            logger.error("Failed to fetch blog entries: %s", e)
+            logger.error("Failed to fetch dashboard text blocks: %s", e)
             return
 
         if not entries:
-            logger.debug("No blog entries found.")
+            logger.debug("No dashboard text blocks found in content region.")
             return
 
         # Find which prompt IDs already have a posted response
@@ -149,8 +186,8 @@ class LLMBridgeAgent:
         new_prompts = [
             e for e in entries
             if self.is_prompt(e)
-            and e.entry_id not in self.processed_ids
-            and e.entry_id not in already_answered
+            and self._entry_id(e) not in self.processed_ids
+            and self._entry_id(e) not in already_answered
         ]
 
         if not new_prompts:
@@ -162,12 +199,13 @@ class LLMBridgeAgent:
         for prompt_entry in new_prompts:
             self._process_prompt(prompt_entry)
 
-    def _process_prompt(self, prompt_entry: BlogEntry):
+    def _process_prompt(self, prompt_entry: TextBlock):
         """Process a single prompt: get LLM response and post it back."""
+        prompt_id = self._entry_id(prompt_entry)
         prompt_text = self.extract_prompt_text(prompt_entry)
         logger.info(
-            "Processing prompt #%d: %.80s...",
-            prompt_entry.entry_id,
+            "Processing prompt block #%d: %.80s...",
+            prompt_id,
             prompt_text,
         )
 
@@ -175,42 +213,46 @@ class LLMBridgeAgent:
         try:
             response_text = self.llm.generate_response(prompt_text)
         except Exception as e:
-            logger.error("LLM failed for #%d: %s", prompt_entry.entry_id, e)
-            response_text = f"[Agent Error: Could not get LLM response — {e}]"
+            logger.error("LLM failed for block #%d: %s", prompt_id, e)
+            response_text = f"[Agent Error: Could not get LLM response - {e}]"
 
-        # 2. Build the response blog entry
-        prompt_subject = prompt_entry.subject.replace(config.PROMPT_MARKER, "", 1).strip()
-        response_subject = f"[LLMR#{prompt_entry.entry_id}] Re: {prompt_subject}"
+        # 2. Build the response text block
+        prompt_title = self._strip_marker(self._entry_title(prompt_entry), config.PROMPT_MARKER)
+        if not prompt_title:
+            prompt_title = prompt_text[:80]
+        response_title = f"[LLMR#{prompt_id}] Re: {prompt_title}"
 
         # Wrap the response in basic HTML
         response_body = self._format_response_html(
-            prompt_text, response_text, prompt_entry.entry_id
+            prompt_text,
+            response_text,
+            prompt_id,
         )
 
         # 3. Post the response
-        # Force replies to be created as "Yourself (draft)" for privacy.
         try:
-            success = self.moodle.create_blog_entry(
-                subject=response_subject,
+            response_block_id = self.moodle.create_dashboard_text_block(
+                title=response_title,
                 body=response_body,
-                publish_state="draft",
+                block_region="content",
             )
-            if success:
-                self.processed_ids.add(prompt_entry.entry_id)
+            if response_block_id is not None:
+                self.processed_ids.add(prompt_id)
                 save_processed_ids(self.processed_ids)
                 logger.info(
-                    "Posted response for prompt #%d",
-                    prompt_entry.entry_id,
+                    "Posted response block #%s for prompt block #%d",
+                    response_block_id,
+                    prompt_id,
                 )
             else:
                 logger.error(
-                    "Failed to post response for prompt #%d",
-                    prompt_entry.entry_id,
+                    "Failed to post response for prompt block #%d",
+                    prompt_id,
                 )
         except Exception as e:
             logger.error(
-                "Error posting response for #%d: %s",
-                prompt_entry.entry_id,
+                "Error posting response for block #%d: %s",
+                prompt_id,
                 e,
             )
 
@@ -218,7 +260,7 @@ class LLMBridgeAgent:
     def _format_response_html(
         prompt_text: str, response_text: str, prompt_id: int
     ) -> str:
-        """Format the LLM response as clean HTML for the blog entry."""
+        """Format the LLM response as clean HTML for a dashboard text block."""
         safe_prompt = html.escape(prompt_text[:500])
         # Convert newlines in response to <br> for HTML display
         safe_response = html.escape(response_text).replace("\n", "<br>")
@@ -226,7 +268,7 @@ class LLMBridgeAgent:
         return (
             f'<div style="font-family: sans-serif; line-height: 1.6;">'
             f'<p style="color: #666; font-size: 0.9em;">'
-            f'<strong>📩 Your prompt (#{prompt_id}):</strong><br>'
+            f'<strong>Your prompt (#{prompt_id}):</strong><br>'
             f'<em>{safe_prompt}</em></p>'
             f'<hr style="border: 1px solid #ddd;">'
             f'<div style="margin-top: 10px;">'
@@ -258,7 +300,7 @@ class LLMBridgeAgent:
             sys.exit(1)
 
         logger.info(
-            "Polling every %ds for [LLMQ] entries",
+            "Polling every %ds for [LLMQ] dashboard text blocks",
             config.POLL_INTERVAL,
         )
 

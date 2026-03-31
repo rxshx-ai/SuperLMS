@@ -23,7 +23,7 @@ import config
 logger = logging.getLogger("api")
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s │ %(name)-8s │ %(levelname)-5s │ %(message)s",
+    format="%(asctime)s | %(name)-8s | %(levelname)-5s | %(message)s",
 )
 
 
@@ -74,8 +74,8 @@ app = FastAPI(
     title="Moodle LLM Bridge API",
     description=(
         "HTTP wrapper around the Moodle LLM Bridge agent. "
-        "The agent polls Moodle for [LLMQ] blog entries and posts "
-        "[LLMR#<id>] responses using an LLM backend."
+        "The agent polls Moodle dashboard text blocks for [LLMQ] prompts "
+        "and posts [LLMR#<id>] responses using an LLM backend."
     ),
     version="0.1.0",
     lifespan=lifespan,
